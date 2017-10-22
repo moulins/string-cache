@@ -68,10 +68,34 @@ impl HeapSizeOf for StringCacheHeap {
     }
 }
 
+struct CacheEntryRefCount {
+    count: AtomicIsize
+}
+
+impl CacheEntryRefCount {
+    fn new(count: isize) -> Self {
+        CacheEntryRefCount {
+            count: AtomicIsize::new(count)
+        }
+    }
+
+    fn incr(&self) -> bool {
+        self.count.fetch_add(1, SeqCst) > 0
+    }
+
+    fn decr(&self) -> bool {
+        self.count.fetch_sub(1, SeqCst) == 1
+    }
+
+    fn is_zero(&self) -> bool {
+        self.count.load(SeqCst) == 0
+    }
+}
+
 struct StringCacheEntry {
     next_in_bucket: Option<Box<StringCacheEntry>>,
     hash: u64,
-    ref_count: AtomicIsize,
+    ref_count: CacheEntryRefCount,
     string: Box<str>,
 }
 
@@ -89,7 +113,7 @@ impl StringCacheEntry {
         StringCacheEntry {
             next_in_bucket: next,
             hash: hash,
-            ref_count: AtomicIsize::new(1),
+            ref_count: CacheEntryRefCount::new(1),
             string: string.into_boxed_str(),
         }
     }
@@ -110,7 +134,7 @@ impl StringCache {
 
             while let Some(entry) = ptr.take() {
                 if entry.hash == hash && &*entry.string == &*string {
-                    if entry.ref_count.fetch_add(1, SeqCst) > 0 {
+                    if entry.ref_count.incr() {
                         return &mut **entry;
                     }
                     // Uh-oh. The pointer's reference count was zero, which means someone may try
@@ -118,7 +142,7 @@ impl StringCache {
                     // destructor check to see whether the reference count is indeed zero, don't
                     // work due to ABA.) Thus we need to temporarily add a duplicate string to the
                     // list.
-                    entry.ref_count.fetch_sub(1, SeqCst);
+                    entry.ref_count.decr();
                     break;
                 }
                 ptr = entry.next_in_bucket.as_mut();
@@ -144,7 +168,7 @@ impl StringCache {
         let ptr = key as *mut StringCacheEntry;
         let bucket_index = {
             let value: &StringCacheEntry = unsafe { &*ptr };
-            debug_assert!(value.ref_count.load(SeqCst) == 0);
+            debug_assert!(value.ref_count.is_zero());
             (value.hash & BUCKET_MASK) as usize
         };
 
@@ -353,7 +377,7 @@ impl<Static: StaticAtomSet> Clone for Atom<Static> {
             match from_packed_dynamic(self.unsafe_data) {
                 Some(entry) => {
                     let entry = entry as *mut StringCacheEntry;
-                    (*entry).ref_count.fetch_add(1, SeqCst);
+                    (*entry).ref_count.incr();
                 },
                 None => (),
             }
@@ -377,7 +401,7 @@ impl<Static: StaticAtomSet> Drop for Atom<Static> {
             match from_packed_dynamic(self.unsafe_data) {
                 Some(entry) => {
                     let entry = entry as *mut StringCacheEntry;
-                    if (*entry).ref_count.fetch_sub(1, SeqCst) == 1 {
+                    if (*entry).ref_count.decr() {
                         drop_slow(self);
                     }
                 }
