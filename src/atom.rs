@@ -233,6 +233,7 @@ impl StaticAtomSet for EmptyStaticAtomSet {
 pub type DefaultAtom = Atom<EmptyStaticAtomSet>;
 
 /// Use this if you don’t care about static atoms.
+#[cfg(feature = "copiable-atoms")]
 pub type DefaultCopiableAtom = CopiableAtom<EmptyStaticAtomSet>;
 
 pub struct Atom<Static: StaticAtomSet> {
@@ -245,6 +246,7 @@ pub struct Atom<Static: StaticAtomSet> {
     pub phantom: PhantomData<Static>,
 }
 
+#[cfg(feature = "copiable-atoms")]
 pub struct CopiableAtom<Static: StaticAtomSet> {
     /// This field is public so that the `atom!()` macros can use it.
     /// You should not otherwise access this field.
@@ -499,6 +501,8 @@ macro_rules! atom_impl_basic_traits {
 }
 
 atom_impl_basic_traits!(Atom);
+
+#[cfg(feature = "copiable-atoms")]
 atom_impl_basic_traits!(CopiableAtom);
 
 fn add_atom_data_to_table<Static: StaticAtomSet>(string_to_add: Cow<str>) -> u64 {
@@ -525,8 +529,10 @@ fn add_atom_data_to_table<Static: StaticAtomSet>(string_to_add: Cow<str>) -> u64
 }
 
 //Manual impl of copy and clone to bypass automatic bounds
+#[cfg(feature = "copiable-atoms")]
 impl<Static: StaticAtomSet> Copy for CopiableAtom<Static> {}
 
+#[cfg(feature = "copiable-atoms")]
 impl<Static: StaticAtomSet> Clone for CopiableAtom<Static> {
     fn clone(&self) -> Self {
         CopiableAtom {
@@ -536,13 +542,14 @@ impl<Static: StaticAtomSet> Clone for CopiableAtom<Static> {
     }
 }
 
+#[cfg(feature = "copiable-atoms")]
 impl<'a, Static: StaticAtomSet> From<Cow<'a, str>> for CopiableAtom<Static> {
     #[inline]
-    fn from(_string_to_add: Cow<'a, str>) -> Self {
+    fn from(string_to_add: Cow<'a, str>) -> Self {
         //FIXME: remove useless increment to ref count;
         //also can *maybe* has more risks overflow the ref count?
         let data = add_atom_data_to_table::<Static>(string_to_add);
-        Atom { unsafe_data: data, phantom: PhantomData }
+        CopiableAtom { unsafe_data: data, phantom: PhantomData }
     }
 }
 

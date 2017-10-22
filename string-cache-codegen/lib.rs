@@ -23,6 +23,7 @@ use std::path::Path;
 /// A builder for a static atom set and relevant macros
 pub struct AtomType {
     path: String,
+    is_copiable: bool,
     macro_name: String,
     atoms: HashSet<String>,
 }
@@ -52,9 +53,19 @@ impl AtomType {
         assert!(macro_name.ends_with("!"));
         AtomType {
             path: path.to_owned(),
+            is_copiable: false,
             macro_name: macro_name[..macro_name.len() - "!".len()].to_owned(),
             atoms: HashSet::new(),
         }
+    }
+
+    /// Use the type `CopiableAtom` instead of `Atom`.
+    /// This type implements `Copy`, but will leak when adding a new atom.
+    /// 
+    /// Requires the feature `copiable-atoms` of the `string-cache` crate.
+    pub fn copiable(&mut self) -> &mut Self {
+        self.is_copiable = true;
+        self
     }
 
     /// Adds an atom to the builder
@@ -112,8 +123,13 @@ impl AtomType {
         let macro_name = quote::Ident::from(&*self.macro_name);
         let path = iter::repeat(quote::Ident::from(&*self.path));
 
-        quote! {
-            pub type #type_name = ::string_cache::Atom<#static_set_name>;
+        let mut tokens = if self.is_copiable {
+            quote! { pub type #type_name = ::string_cache::CopiableAtom<#static_set_name>; }
+        } else {
+            quote! { pub type #type_name = ::string_cache::Atom<#static_set_name>; }
+        };
+
+        let tokens_rest = quote! {
             pub struct #static_set_name;
             impl ::string_cache::StaticAtomSet for #static_set_name {
                 fn get() -> &'static ::string_cache::PhfStrSet {
@@ -140,7 +156,10 @@ impl AtomType {
                     };
                 )*
             }
-        }
+        };
+
+        tokens.append(tokens_rest);
+        tokens
     }
 
     /// Create a new file at `path` and write generated code there.
