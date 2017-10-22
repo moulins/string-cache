@@ -1,5 +1,7 @@
 # string-cache
 
+DISCLAIMER: This is a WIP experimental fork, which adds support for copiable atoms
+
 [![Build Status](https://travis-ci.org/servo/string-cache.svg?branch=master)](https://travis-ci.org/servo/string-cache)
 
 [Documentation](https://docs.rs/string_cache/)
