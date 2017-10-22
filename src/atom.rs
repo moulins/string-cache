@@ -73,20 +73,25 @@ struct CacheEntryRefCount {
 }
 
 impl CacheEntryRefCount {
-    fn new(count: isize) -> Self {
+    fn new() -> Self {
         CacheEntryRefCount {
-            count: AtomicIsize::new(count)
+            count: AtomicIsize::new(1)
         }
     }
 
+    //Increment ref count, return true if the ref is not dropped
+    #[inline]
     fn incr(&self) -> bool {
         self.count.fetch_add(1, SeqCst) > 0
     }
 
+    //Decrement ref count, return true if the ref must be dropped
+    #[inline]
     fn decr(&self) -> bool {
         self.count.fetch_sub(1, SeqCst) == 1
     }
 
+    #[inline]
     fn is_zero(&self) -> bool {
         self.count.load(SeqCst) == 0
     }
@@ -113,7 +118,7 @@ impl StringCacheEntry {
         StringCacheEntry {
             next_in_bucket: next,
             hash: hash,
-            ref_count: CacheEntryRefCount::new(1),
+            ref_count: CacheEntryRefCount::new(),
             string: string.into_boxed_str(),
         }
     }
@@ -227,6 +232,9 @@ impl StaticAtomSet for EmptyStaticAtomSet {
 /// Use this if you don’t care about static atoms.
 pub type DefaultAtom = Atom<EmptyStaticAtomSet>;
 
+/// Use this if you don’t care about static atoms.
+pub type DefaultCopiableAtom = CopiableAtom<EmptyStaticAtomSet>;
+
 pub struct Atom<Static: StaticAtomSet> {
     /// This field is public so that the `atom!()` macros can use it.
     /// You should not otherwise access this field.
@@ -237,24 +245,14 @@ pub struct Atom<Static: StaticAtomSet> {
     pub phantom: PhantomData<Static>,
 }
 
-#[cfg(feature = "heapsize")]
-impl<Static: StaticAtomSet> HeapSizeOf for Atom<Static> {
-    #[inline(always)]
-    fn heap_size_of_children(&self) -> usize {
-        0
-    }
-}
+pub struct CopiableAtom<Static: StaticAtomSet> {
+    /// This field is public so that the `atom!()` macros can use it.
+    /// You should not otherwise access this field.
+    #[doc(hidden)]
+    pub unsafe_data: u64,
 
-impl<Static: StaticAtomSet> ::precomputed_hash::PrecomputedHash for Atom<Static> {
-    fn precomputed_hash(&self) -> u32 {
-        self.get_hash()
-    }
-}
-
-impl<'a, Static: StaticAtomSet> From<&'a Atom<Static>> for Atom<Static> {
-    fn from(atom: &'a Self) -> Self {
-        atom.clone()
-    }
+    #[doc(hidden)]
+    pub phantom: PhantomData<*const Static>,
 }
 
 fn u64_hash_as_u32(h: u64) -> u32 {
@@ -262,111 +260,297 @@ fn u64_hash_as_u32(h: u64) -> u32 {
     ((h >> 32) ^ h) as u32
 }
 
-impl<Static: StaticAtomSet> Atom<Static> {
-    #[inline(always)]
-    unsafe fn unpack(&self) -> UnpackedAtom {
-        UnpackedAtom::from_packed(self.unsafe_data)
-    }
+macro_rules! atom_impl_basic_traits {
+    ($atom:ident) => {
+        #[cfg(feature = "heapsize")]
+        impl<Static: StaticAtomSet> HeapSizeOf for $atom<Static> {
+            #[inline(always)]
+            fn heap_size_of_children(&self) -> usize {
+                0
+            }
+        }
 
-    pub fn get_hash(&self) -> u32 {
-        match unsafe { self.unpack() } {
-            Static(index) => {
-                let static_set = Static::get();
-                static_set.hashes[index as usize]
+        impl<Static: StaticAtomSet> ::precomputed_hash::PrecomputedHash for $atom<Static> {
+            fn precomputed_hash(&self) -> u32 {
+                self.get_hash()
             }
-            Dynamic(entry) => {
-                let entry = entry as *mut StringCacheEntry;
-                u64_hash_as_u32(unsafe { (*entry).hash })
+        }
+
+        impl<'a, Static: StaticAtomSet> From<&'a $atom<Static>> for $atom<Static> {
+            fn from(atom: &'a Self) -> Self {
+                atom.clone()
             }
-            Inline(..) => {
-                u64_hash_as_u32(self.unsafe_data)
+        }
+
+        impl<Static: StaticAtomSet> $atom<Static> {
+            #[inline(always)]
+            unsafe fn unpack(&self) -> UnpackedAtom {
+                UnpackedAtom::from_packed(self.unsafe_data)
+            }
+
+            pub fn get_hash(&self) -> u32 {
+                match unsafe { self.unpack() } {
+                    Static(index) => {
+                        let static_set = Static::get();
+                        static_set.hashes[index as usize]
+                    }
+                    Dynamic(entry) => {
+                        let entry = entry as *mut StringCacheEntry;
+                        u64_hash_as_u32(unsafe { (*entry).hash })
+                    }
+                    Inline(..) => {
+                        u64_hash_as_u32(self.unsafe_data)
+                    }
+                }
+            }
+        }
+
+        impl<Static: StaticAtomSet> Default for $atom<Static> {
+            #[inline]
+            fn default() -> Self {
+                $atom {
+                    unsafe_data: pack_static(Static::empty_string_index()),
+                    phantom: PhantomData
+                }
+            }
+        }
+
+        impl<Static: StaticAtomSet> Hash for $atom<Static> {
+            #[inline]
+            fn hash<H>(&self, state: &mut H) where H: Hasher {
+                state.write_u32(self.get_hash())
+            }
+        }
+
+        impl<Static: StaticAtomSet> Eq for $atom<Static> {}
+
+        // NOTE: This impl requires that a given string must always be interned the same way.
+        impl<Static: StaticAtomSet> PartialEq for $atom<Static> {
+            #[inline]
+            fn eq(&self, other: &Self) -> bool {
+                self.unsafe_data == other.unsafe_data
+            }
+        }
+
+        impl<Static: StaticAtomSet> PartialEq<str> for $atom<Static> {
+            fn eq(&self, other: &str) -> bool {
+                &self[..] == other
+            }
+        }
+
+        impl<Static: StaticAtomSet> PartialEq<$atom<Static>> for str {
+            fn eq(&self, other: &$atom<Static>) -> bool {
+                self == &other[..]
+            }
+        }
+
+        impl<Static: StaticAtomSet> PartialEq<String> for $atom<Static> {
+            fn eq(&self, other: &String) -> bool {
+                &self[..] == &other[..]
+            }
+        }  
+
+        impl<'a, Static: StaticAtomSet> From<&'a str> for $atom<Static> {
+            #[inline]
+            fn from(string_to_add: &str) -> Self {
+                $atom::from(Cow::Borrowed(string_to_add))
+            }
+        }
+
+        impl<Static: StaticAtomSet> From<String> for $atom<Static> {
+            #[inline]
+            fn from(string_to_add: String) -> Self {
+                $atom::from(Cow::Owned(string_to_add))
+            }
+        }
+
+        impl<Static: StaticAtomSet> ops::Deref for $atom<Static> {
+            type Target = str;
+
+            #[inline]
+            fn deref(&self) -> &str {
+                unsafe {
+                    match self.unpack() {
+                        Inline(..) => {
+                            let buf = inline_orig_bytes(&self.unsafe_data);
+                            str::from_utf8_unchecked(buf)
+                        },
+                        Static(idx) => Static::get().atoms.get(idx as usize).expect("bad static atom"),
+                        Dynamic(entry) => {
+                            let entry = entry as *mut StringCacheEntry;
+                            &(*entry).string
+                        }
+                    }
+                }
+            }
+        }
+
+        impl<Static: StaticAtomSet> fmt::Display for $atom<Static> {
+            #[inline]
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                <str as fmt::Display>::fmt(self, f)
+            }
+        }
+
+        impl<Static: StaticAtomSet> fmt::Debug for $atom<Static> {
+            #[inline]
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                let ty_str = unsafe {
+                    match self.unpack() {
+                        Dynamic(..) => "dynamic",
+                        Inline(..) => "inline",
+                        Static(..) => "static",
+                    }
+                };
+
+                write!(f, "Atom('{}' type={})", &*self, ty_str)
+            }
+        }
+
+        impl<Static: StaticAtomSet> PartialOrd for $atom<Static> {
+            #[inline]
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                if self.unsafe_data == other.unsafe_data {
+                    return Some(Equal);
+                }
+                self.as_ref().partial_cmp(other.as_ref())
+            }
+        }
+
+        impl<Static: StaticAtomSet> Ord for $atom<Static> {
+            #[inline]
+            fn cmp(&self, other: &Self) -> Ordering {
+                if self.unsafe_data == other.unsafe_data {
+                    return Equal;
+                }
+                self.as_ref().cmp(other.as_ref())
+            }
+        }
+
+        impl<Static: StaticAtomSet> AsRef<str> for $atom<Static> {
+            fn as_ref(&self) -> &str {
+                &self
+            }
+        }
+
+        impl<Static: StaticAtomSet> Serialize for $atom<Static> {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error> where S: Serializer {
+                let string: &str = self.as_ref();
+                string.serialize(serializer)
+            }
+        }
+
+        impl<'a, Static: StaticAtomSet> Deserialize<'a> for $atom<Static> {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error> where D: Deserializer<'a> {
+                let string: String = try!(Deserialize::deserialize(deserializer));
+                Ok($atom::from(string))
+            }
+        }
+
+        // AsciiExt requires mutating methods, so we just implement the non-mutating ones.
+        // We don't need to implement is_ascii because there's no performance improvement
+        // over the one from &str.
+        impl<Static: StaticAtomSet> $atom<Static> {
+            fn from_mutated_str<F: FnOnce(&mut str)>(s: &str, f: F) -> Self {
+                let mut buffer: [u8; 64] = unsafe { mem::uninitialized() };
+                if let Some(buffer_prefix) = buffer.get_mut(..s.len()) {
+                    buffer_prefix.copy_from_slice(s.as_bytes());
+                    // FIXME: use from std::str when stable https://github.com/rust-lang/rust/issues/41119
+                    pub unsafe fn from_utf8_unchecked_mut(v: &mut [u8]) -> &mut str {
+                        mem::transmute(v)
+                    }
+                    let as_str = unsafe { from_utf8_unchecked_mut(buffer_prefix) };
+                    f(as_str);
+                    $atom::from(&*as_str)
+                } else {
+                    let mut string = s.to_owned();
+                    f(&mut string);
+                    $atom::from(string)
+                }
+            }
+
+            pub fn to_ascii_uppercase(&self) -> Self {
+                for (i, b) in self.bytes().enumerate() {
+                    if let b'a' ... b'z' = b {
+                        return $atom::from_mutated_str(self, |s| s[i..].make_ascii_uppercase())
+                    }
+                }
+                self.clone()
+            }
+
+            pub fn to_ascii_lowercase(&self) -> Self {
+                for (i, b) in self.bytes().enumerate() {
+                    if let b'A' ... b'Z' = b {
+                        return $atom::from_mutated_str(self, |s| s[i..].make_ascii_lowercase())
+                    }
+                }
+                self.clone()
+            }
+
+            pub fn eq_ignore_ascii_case(&self, other: &Self) -> bool {
+                (self == other) || self.eq_str_ignore_ascii_case(&**other)
+            }
+
+            pub fn eq_str_ignore_ascii_case(&self, other: &str) -> bool {
+                (&**self).eq_ignore_ascii_case(other)
             }
         }
     }
 }
 
-impl<Static: StaticAtomSet> Default for Atom<Static> {
-    #[inline]
-    fn default() -> Self {
-        Atom {
-            unsafe_data: pack_static(Static::empty_string_index()),
+atom_impl_basic_traits!(Atom);
+atom_impl_basic_traits!(CopiableAtom);
+
+fn add_atom_data_to_table<Static: StaticAtomSet>(string_to_add: Cow<str>) -> u64 {
+    let static_set = Static::get();
+    let hash = phf_shared::hash(&*string_to_add, static_set.key);
+    let index = phf_shared::get_index(hash, static_set.disps, static_set.atoms.len());
+
+    let unpacked = if static_set.atoms[index as usize] == string_to_add {
+        Static(index)
+    } else {
+        let len = string_to_add.len();
+        if len <= MAX_INLINE_LEN {
+            let mut buf: [u8; 7] = [0; 7];
+            buf[..len].copy_from_slice(string_to_add.as_bytes());
+            Inline(len as u8, buf)
+        } else {
+            Dynamic(STRING_CACHE.lock().unwrap().add(string_to_add, hash) as *mut ())
+        }
+    };
+
+    let data = unsafe { unpacked.pack() };
+    log!(Event::Intern(data));
+    data
+}
+
+//Manual impl of copy and clone to bypass automatic bounds
+impl<Static: StaticAtomSet> Copy for CopiableAtom<Static> {}
+
+impl<Static: StaticAtomSet> Clone for CopiableAtom<Static> {
+    fn clone(&self) -> Self {
+        CopiableAtom {
+            unsafe_data: self.unsafe_data,
             phantom: PhantomData
         }
     }
 }
 
-impl<Static: StaticAtomSet> Hash for Atom<Static> {
+impl<'a, Static: StaticAtomSet> From<Cow<'a, str>> for CopiableAtom<Static> {
     #[inline]
-    fn hash<H>(&self, state: &mut H) where H: Hasher {
-        state.write_u32(self.get_hash())
-    }
-}
-
-impl<Static: StaticAtomSet> Eq for Atom<Static> {}
-
-// NOTE: This impl requires that a given string must always be interned the same way.
-impl<Static: StaticAtomSet> PartialEq for Atom<Static> {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.unsafe_data == other.unsafe_data
-    }
-}
-
-impl<Static: StaticAtomSet> PartialEq<str> for Atom<Static> {
-    fn eq(&self, other: &str) -> bool {
-        &self[..] == other
-    }
-}
-
-impl<Static: StaticAtomSet> PartialEq<Atom<Static>> for str {
-    fn eq(&self, other: &Atom<Static>) -> bool {
-        self == &other[..]
-    }
-}
-
-impl<Static: StaticAtomSet> PartialEq<String> for Atom<Static> {
-    fn eq(&self, other: &String) -> bool {
-        &self[..] == &other[..]
+    fn from(_string_to_add: Cow<'a, str>) -> Self {
+        //FIXME: remove useless increment to ref count;
+        //also can *maybe* has more risks overflow the ref count?
+        let data = add_atom_data_to_table::<Static>(string_to_add);
+        Atom { unsafe_data: data, phantom: PhantomData }
     }
 }
 
 impl<'a, Static: StaticAtomSet> From<Cow<'a, str>> for Atom<Static> {
     #[inline]
     fn from(string_to_add: Cow<'a, str>) -> Self {
-        let static_set = Static::get();
-        let hash = phf_shared::hash(&*string_to_add, static_set.key);
-        let index = phf_shared::get_index(hash, static_set.disps, static_set.atoms.len());
-
-        let unpacked = if static_set.atoms[index as usize] == string_to_add {
-            Static(index)
-        } else {
-            let len = string_to_add.len();
-            if len <= MAX_INLINE_LEN {
-                let mut buf: [u8; 7] = [0; 7];
-                buf[..len].copy_from_slice(string_to_add.as_bytes());
-                Inline(len as u8, buf)
-            } else {
-                Dynamic(STRING_CACHE.lock().unwrap().add(string_to_add, hash) as *mut ())
-            }
-        };
-
-        let data = unsafe { unpacked.pack() };
-        log!(Event::Intern(data));
+        let data = add_atom_data_to_table::<Static>(string_to_add);
         Atom { unsafe_data: data, phantom: PhantomData }
-    }
-}
-
-impl<'a, Static: StaticAtomSet> From<&'a str> for Atom<Static> {
-    #[inline]
-    fn from(string_to_add: &str) -> Self {
-        Atom::from(Cow::Borrowed(string_to_add))
-    }
-}
-
-impl<Static: StaticAtomSet> From<String> for Atom<Static> {
-    #[inline]
-    fn from(string_to_add: String) -> Self {
-        Atom::from(Cow::Owned(string_to_add))
     }
 }
 
@@ -408,138 +592,6 @@ impl<Static: StaticAtomSet> Drop for Atom<Static> {
                 _ => (),
             }
         }
-    }
-}
-
-impl<Static: StaticAtomSet> ops::Deref for Atom<Static> {
-    type Target = str;
-
-    #[inline]
-    fn deref(&self) -> &str {
-        unsafe {
-            match self.unpack() {
-                Inline(..) => {
-                    let buf = inline_orig_bytes(&self.unsafe_data);
-                    str::from_utf8_unchecked(buf)
-                },
-                Static(idx) => Static::get().atoms.get(idx as usize).expect("bad static atom"),
-                Dynamic(entry) => {
-                    let entry = entry as *mut StringCacheEntry;
-                    &(*entry).string
-                }
-            }
-        }
-    }
-}
-
-impl<Static: StaticAtomSet> fmt::Display for Atom<Static> {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        <str as fmt::Display>::fmt(self, f)
-    }
-}
-
-impl<Static: StaticAtomSet> fmt::Debug for Atom<Static> {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let ty_str = unsafe {
-            match self.unpack() {
-                Dynamic(..) => "dynamic",
-                Inline(..) => "inline",
-                Static(..) => "static",
-            }
-        };
-
-        write!(f, "Atom('{}' type={})", &*self, ty_str)
-    }
-}
-
-impl<Static: StaticAtomSet> PartialOrd for Atom<Static> {
-    #[inline]
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        if self.unsafe_data == other.unsafe_data {
-            return Some(Equal);
-        }
-        self.as_ref().partial_cmp(other.as_ref())
-    }
-}
-
-impl<Static: StaticAtomSet> Ord for Atom<Static> {
-    #[inline]
-    fn cmp(&self, other: &Self) -> Ordering {
-        if self.unsafe_data == other.unsafe_data {
-            return Equal;
-        }
-        self.as_ref().cmp(other.as_ref())
-    }
-}
-
-impl<Static: StaticAtomSet> AsRef<str> for Atom<Static> {
-    fn as_ref(&self) -> &str {
-        &self
-    }
-}
-
-impl<Static: StaticAtomSet> Serialize for Atom<Static> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error> where S: Serializer {
-        let string: &str = self.as_ref();
-        string.serialize(serializer)
-    }
-}
-
-impl<'a, Static: StaticAtomSet> Deserialize<'a> for Atom<Static> {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error> where D: Deserializer<'a> {
-        let string: String = try!(Deserialize::deserialize(deserializer));
-        Ok(Atom::from(string))
-    }
-}
-
-// AsciiExt requires mutating methods, so we just implement the non-mutating ones.
-// We don't need to implement is_ascii because there's no performance improvement
-// over the one from &str.
-impl<Static: StaticAtomSet> Atom<Static> {
-    fn from_mutated_str<F: FnOnce(&mut str)>(s: &str, f: F) -> Self {
-        let mut buffer: [u8; 64] = unsafe { mem::uninitialized() };
-        if let Some(buffer_prefix) = buffer.get_mut(..s.len()) {
-            buffer_prefix.copy_from_slice(s.as_bytes());
-            // FIXME: use from std::str when stable https://github.com/rust-lang/rust/issues/41119
-            pub unsafe fn from_utf8_unchecked_mut(v: &mut [u8]) -> &mut str {
-                mem::transmute(v)
-            }
-            let as_str = unsafe { from_utf8_unchecked_mut(buffer_prefix) };
-            f(as_str);
-            Atom::from(&*as_str)
-        } else {
-            let mut string = s.to_owned();
-            f(&mut string);
-            Atom::from(string)
-        }
-    }
-
-    pub fn to_ascii_uppercase(&self) -> Self {
-        for (i, b) in self.bytes().enumerate() {
-            if let b'a' ... b'z' = b {
-                return Atom::from_mutated_str(self, |s| s[i..].make_ascii_uppercase())
-            }
-        }
-        self.clone()
-    }
-
-    pub fn to_ascii_lowercase(&self) -> Self {
-        for (i, b) in self.bytes().enumerate() {
-            if let b'A' ... b'Z' = b {
-                return Atom::from_mutated_str(self, |s| s[i..].make_ascii_lowercase())
-            }
-        }
-        self.clone()
-    }
-
-    pub fn eq_ignore_ascii_case(&self, other: &Self) -> bool {
-        (self == other) || self.eq_str_ignore_ascii_case(&**other)
-    }
-
-    pub fn eq_str_ignore_ascii_case(&self, other: &str) -> bool {
-        (&**self).eq_ignore_ascii_case(other)
     }
 }
 
