@@ -25,6 +25,9 @@ extern crate string_cache_shared as shared;
 
 pub use atom::{Atom, StaticAtomSet, PhfStrSet, EmptyStaticAtomSet, DefaultAtom};
 
+#[cfg(feature = "copiable-atoms")]
+pub use atom::CopiableAtom;
+
 #[cfg(feature = "log-events")]
 #[macro_use]
 pub mod event;

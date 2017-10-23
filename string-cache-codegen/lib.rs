@@ -19,13 +19,44 @@ use std::fs::File;
 use std::io::{self, Write, BufWriter};
 use std::iter;
 use std::path::Path;
+use quote::Ident;
 
 /// A builder for a static atom set and relevant macros
 pub struct AtomType {
-    path: String,
-    is_copiable: bool,
-    macro_name: String,
+    base_type: Option<TypeInfo>,
+    copiable_type: Option<TypeInfo>,
     atoms: HashSet<String>,
+}
+
+#[derive(Clone)]
+struct TypeInfo {
+    static_set_name: Ident,
+    type_name: Ident,
+    macro_name: Ident,
+    path: Ident,
+}
+
+fn mk_type_info(path: &str, macro_name: &str) -> TypeInfo {
+    assert!(macro_name.ends_with("!"));
+    let type_name = if let Some(position) = path.rfind("::") {
+        &path[position + "::".len() ..]
+    } else {
+        path
+    }.to_owned();
+
+    let static_set_name = Ident::from(format!("{}StaticSet", type_name));
+    let type_name = Ident::from(type_name);
+
+    let macro_name = &macro_name[..macro_name.len() - "!".len()];
+    let macro_name = Ident::from(macro_name.to_owned());
+
+    let path = Ident::from(path.to_owned());
+    TypeInfo {
+        static_set_name,
+        type_name,
+        macro_name,
+        path
+    }
 }
 
 impl AtomType {
@@ -50,21 +81,34 @@ impl AtomType {
     ///    // Expands to: $crate::foo::FooAtom { … }
     /// }
     pub fn new(path: &str, macro_name: &str) -> Self {
-        assert!(macro_name.ends_with("!"));
         AtomType {
-            path: path.to_owned(),
-            is_copiable: false,
-            macro_name: macro_name[..macro_name.len() - "!".len()].to_owned(),
+            base_type: Some(mk_type_info(path, macro_name)),
+            copiable_type: None,
             atoms: HashSet::new(),
         }
     }
 
-    /// Use the type `CopiableAtom` instead of `Atom`.
+    /// Same as `AtomType::new`, but constructs the type `CopiableAtom` instead of `Atom`.
     /// This type implements `Copy`, but will leak when adding a new atom.
     /// 
     /// Requires the feature `copiable-atoms` of the `string-cache` crate.
-    pub fn copiable(&mut self) -> &mut Self {
-        self.is_copiable = true;
+    pub fn new_copiable(path: &str, macro_name: &str) -> Self {
+        AtomType {
+            base_type: None,
+            copiable_type: Some(mk_type_info(path, macro_name)),
+            atoms: HashSet::new(),
+        }
+    }
+
+    /// Constructs the type `CopiableAtom` instead of `Atom`.
+    /// This type implements `Copy`, but will leak when adding a new atom.
+    /// 
+    /// Requires the feature `copiable-atoms` of the `string-cache` crate.
+    pub fn copiable(&mut self, path: &str, macro_name: &str) -> &mut Self {
+        if let Some(_) = self.copiable_type {
+            panic!("copiable type already defined")
+        }
+        self.copiable_type = Some(mk_type_info(path, macro_name));
         self
     }
 
@@ -94,6 +138,29 @@ impl AtomType {
             .as_bytes())
     }
 
+    fn type_to_tokens(type_info: TypeInfo, atom_type: &str, static_set_name: quote::Ident,
+            atoms: &[&str], data: &[quote::Hex<u64>]) -> quote::Tokens {
+        let type_name = type_info.type_name;
+        let path = iter::repeat(type_info.path);
+        let macro_name = type_info.macro_name;
+        let atom_type = Ident::from(atom_type);
+        quote! {
+            pub type #type_name = #atom_type<#static_set_name>;
+
+            #[macro_export]
+            macro_rules! #macro_name {
+                #(
+                    (#atoms) => {
+                        $crate::#path {
+                            unsafe_data: #data,
+                            phantom: ::std::marker::PhantomData,
+                        }
+                    };
+                )*
+            }
+        }
+    }
+
     fn to_tokens(&mut self) -> quote::Tokens {
         // `impl Default for Atom` requires the empty string to be in the static set.
         // This also makes sure the set in non-empty,
@@ -105,7 +172,7 @@ impl AtomType {
         let phf_generator::HashState { key, disps, map } = hash_state;
         let atoms: Vec<&str> = map.iter().map(|&idx| atoms[idx]).collect();
         let empty_string_index = atoms.iter().position(|s| s.is_empty()).unwrap() as u32;
-        let data = (0..atoms.len()).map(|i| quote::Hex(shared::pack_static(i as u32)));
+        let data: Vec<_> = (0..atoms.len()).map(|i| quote::Hex(shared::pack_static(i as u32))).collect();
 
         let hashes: Vec<u32> =
             atoms.iter().map(|string| {
@@ -113,23 +180,13 @@ impl AtomType {
                 ((hash >> 32) ^ hash) as u32
             }).collect();
 
-        let type_name = if let Some(position) = self.path.rfind("::") {
-            &self.path[position + "::".len() ..]
-        } else {
-            &self.path
-        };
-        let static_set_name = quote::Ident::from(format!("{}StaticSet", type_name));
-        let type_name = quote::Ident::from(type_name);
-        let macro_name = quote::Ident::from(&*self.macro_name);
-        let path = iter::repeat(quote::Ident::from(&*self.path));
+        let static_set_name = & match (&self.base_type, &self.copiable_type) {
+            (&Some(ref ty), _) => ty,
+            (&None, &Some(ref ty)) => ty,
+            _ => unreachable!()
+        }.static_set_name.to_owned();
 
-        let mut tokens = if self.is_copiable {
-            quote! { pub type #type_name = ::string_cache::CopiableAtom<#static_set_name>; }
-        } else {
-            quote! { pub type #type_name = ::string_cache::Atom<#static_set_name>; }
-        };
-
-        let tokens_rest = quote! {
+        let mut tokens = quote! {
             pub struct #static_set_name;
             impl ::string_cache::StaticAtomSet for #static_set_name {
                 fn get() -> &'static ::string_cache::PhfStrSet {
@@ -145,20 +202,15 @@ impl AtomType {
                     #empty_string_index
                 }
             }
-            #[macro_export]
-            macro_rules! #macro_name {
-                #(
-                    (#atoms) => {
-                        $crate::#path {
-                            unsafe_data: #data,
-                            phantom: ::std::marker::PhantomData,
-                        }
-                    };
-                )*
-            }
         };
 
-        tokens.append(tokens_rest);
+        self.base_type.clone().map(|info| tokens.append(
+            AtomType::type_to_tokens(info, "::string_cache::Atom", static_set_name.clone(), &atoms, &data)
+        ));
+        self.copiable_type.clone().map(|info| tokens.append(
+            AtomType::type_to_tokens(info, "::string_cache::CopiableAtom", static_set_name.clone(), &atoms, &data)
+        ));
+        
         tokens
     }
 
