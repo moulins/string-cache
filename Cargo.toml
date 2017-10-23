@@ -27,6 +27,9 @@ log-events = []
 # Use unstable features to optimize space and time (memory and CPU usage).
 unstable = []
 
+# Enable copiable atoms
+copiable-atoms = []
+
 [dependencies]
 precomputed-hash = "0.1"
 lazy_static = "0.2"
