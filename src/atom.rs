@@ -254,7 +254,7 @@ pub struct CopiableAtom<Static: StaticAtomSet> {
     pub unsafe_data: u64,
 
     #[doc(hidden)]
-    pub phantom: PhantomData<*const Static>,
+    pub phantom: PhantomData<Static>,
 }
 
 fn u64_hash_as_u32(h: u64) -> u32 {
@@ -547,7 +547,7 @@ impl<'a, Static: StaticAtomSet> From<Cow<'a, str>> for CopiableAtom<Static> {
     #[inline]
     fn from(string_to_add: Cow<'a, str>) -> Self {
         //FIXME: remove useless increment to ref count;
-        //also can *maybe* has more risk of overflowing the ref count?
+        //also *maybe* has more risk of overflowing the ref count?
         let data = add_atom_data_to_table::<Static>(string_to_add);
         CopiableAtom { unsafe_data: data, phantom: PhantomData }
     }
